@@ -67,6 +67,22 @@ def _gen_id(prefix: str, n: int) -> str:
 BUILTIN_TOOLS = ["Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch",
                  "Glob", "Grep", "LS", "Task", "NotebookEdit"]
 
+# Reframes the model as a plain LLM. Claude Code otherwise behaves like a coding
+# agent ("let me diagnose / verify / search the files") and references tools that
+# don't exist in this context. Appended to the user's own system prompt.
+LLM_GUARDRAIL = (
+    "You are a helpful AI assistant accessed through a plain text API. "
+    "You have NO tools, NO file system, NO terminal, and NO ability to run commands, "
+    "read files, browse, or inspect any environment. Never say you will diagnose, "
+    "investigate, verify behavior, search files, or use any tool. Answer directly and "
+    "completely using only your own knowledge and this conversation. If something is "
+    "outside your knowledge, say so plainly instead of pretending to look it up."
+)
+
+
+def _with_guardrail(system_prompt: str) -> str:
+    return (system_prompt + "\n\n" + LLM_GUARDRAIL).strip() if system_prompt else LLM_GUARDRAIL
+
 
 def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptions:
     """Build SDK options. Three modes:
@@ -81,7 +97,8 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
     base: dict[str, Any] = dict(
         setting_sources=[],
         permission_mode="default",
-        disallowed_tools=BUILTIN_TOOLS,
+        tools=[],                    # --tools "" : strip ALL built-in tools + their defs
+        disallowed_tools=BUILTIN_TOOLS,   # belt-and-suspenders
     )
     if config.DISABLE_THINKING:
         base["thinking"] = {"type": "disabled"}
@@ -102,8 +119,7 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
             output_format={"type": "json_schema", "schema": schema},
             allowed_tools=[],   # no tools -> model answers directly from the prompt
             max_turns=config.TOOL_MAX_TURNS,   # native StructuredOutput uses ~2 turns
-            system_prompt=(system_prompt + "\n\nAnswer only from the conversation above. "
-                           "Do not use any tools. Return the structured result directly.").strip(),
+            system_prompt=_with_guardrail(system_prompt) + "\n\nReturn the structured result directly.",
         ))
 
     # === passthrough function tools ===
@@ -149,7 +165,7 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
         return PermissionResultDeny(behavior="deny", message="tool disabled", interrupt=True)
 
     return build(dict(
-        system_prompt=system_prompt or None,
+        system_prompt=_with_guardrail(system_prompt),
         max_turns=1 if config.SINGLE_TURN else config.MAX_TURNS,
         can_use_tool=deny_all,
     ))
