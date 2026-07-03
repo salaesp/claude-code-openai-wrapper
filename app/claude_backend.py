@@ -20,11 +20,17 @@ Events yielded by `run()`:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from typing import Any, AsyncIterator
 
 from .log import logger
+
+# The SDK spawns a second node process (`claude -v`) on every connect just to
+# check the version. Skip it: real startup-latency win, zero behavior change.
+os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -64,8 +70,47 @@ def _gen_id(prefix: str, n: int) -> str:
     return f"{prefix}_{abs(hash((prefix, n))) % (10**12):012d}"
 
 
+class CaptureHolder:
+    """Mutable indirection for per-request capture state.
+
+    A warm client's closures are bound at connect time, possibly by an earlier
+    request with the same options key. They read `holder.capture`, which the
+    consuming request swaps to its own dict at checkout.
+    """
+    __slots__ = ("capture",)
+
+    def __init__(self) -> None:
+        self.capture: dict = {}
+
+
+def _request_key(req: ChatCompletionRequest, mode: str) -> str:
+    """Hash of everything that influences the spawned CLI process.
+
+    Two requests with the same key produce byte-identical CLI invocations, so a
+    client pre-spawned for one can safely serve the other.
+    """
+    system_prompt, _ = build_prompt(req.messages)
+    sig = {
+        "mode": mode,
+        "model": req.model,
+        "system": system_prompt,
+        "schema": (req.response_format.json_schema or {}) if req.response_format else None,
+        "rf_type": req.response_format.type if req.response_format else None,
+        "tools": [t.model_dump() for t in req.tools] if req.tools else None,
+        "tool_choice": req.tool_choice if isinstance(req.tool_choice, str) else
+                       (json.dumps(req.tool_choice, sort_keys=True) if req.tool_choice else None),
+        # config knobs that alter options at build time
+        "single_turn": config.SINGLE_TURN,
+        "concise": config.CONCISE,
+        "thinking_off": config.DISABLE_THINKING,
+        "tool_max_turns": config.TOOL_MAX_TURNS,
+        "max_turns": config.MAX_TURNS,
+    }
+    return hashlib.sha256(json.dumps(sig, sort_keys=True).encode()).hexdigest()[:16]
+
+
 BUILTIN_TOOLS = ["Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch",
-                 "Glob", "Grep", "LS", "Task", "NotebookEdit"]
+                 "Glob", "Grep", "Task", "NotebookEdit"]
 
 # Reframes the model as a plain LLM. Claude Code otherwise behaves like a coding
 # agent ("let me diagnose / verify / search the files") and references tools that
@@ -94,7 +139,7 @@ def _with_guardrail(system_prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptions:
+def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAgentOptions:
     """Build SDK options. Three modes:
 
     - structured: native --json-schema output (no MCP, no ToolSearch, single exchange)
@@ -109,6 +154,9 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
         permission_mode="default",
         tools=[],                    # --tools "" : strip ALL built-in tools + their defs
         disallowed_tools=BUILTIN_TOOLS,   # belt-and-suspenders
+        strict_mcp_config=True,      # don't scan user/project MCP configs
+        env={"DISABLE_AUTOUPDATER": "1",
+             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},  # cut CLI startup work
     )
     if config.DISABLE_THINKING:
         base["thinking"] = {"type": "disabled"}
@@ -153,10 +201,12 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
         logger.debug("registered passthrough tools: %s", tool_names)
 
         async def can_use_tool(tool_name: str, tool_input: dict, ctx) -> Any:
+            capture = holder.capture   # indirection: rebound per request at checkout
             if tool_name.startswith(TOOL_PREFIX):
                 short = tool_name[len(TOOL_PREFIX):]
                 capture.setdefault("calls", []).append({"name": short, "args": tool_input})
-                logger.info("captured tool_call: %s args=%s", short, json.dumps(tool_input)[:400])
+                logger.info("captured tool_call: %s", short)
+                logger.debug("tool_call args: %s", json.dumps(tool_input)[:400])
                 return PermissionResultDeny(behavior="deny", message="captured", interrupt=True)
             capture.setdefault("blocked", []).append(tool_name)
             logger.warning("blocked non-passthrough tool: %s", tool_name)
@@ -171,7 +221,7 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
 
     # === plain chat: single turn ===
     async def deny_all(tool_name, tool_input, ctx):
-        capture.setdefault("blocked", []).append(tool_name)
+        holder.capture.setdefault("blocked", []).append(tool_name)
         return PermissionResultDeny(behavior="deny", message="tool disabled", interrupt=True)
 
     return build(dict(
@@ -184,8 +234,9 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
 
 async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     """Yield ("text", str) / ("tool_calls", list) / ("done", None)."""
+    from .pool import pool
+
     capture: dict = {}
-    options = _make_options(req, capture)
     _, user_prompt = build_prompt(req.messages)
 
     n_tools = len(req.tools or [])
@@ -195,9 +246,23 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         or mode == "structured"
     # tools/structured use TOOL_MAX_TURNS; single-turn applies to plain chat only
     eff_turns = config.TOOL_MAX_TURNS if mode != "chat" else (1 if config.SINGLE_TURN else config.MAX_TURNS)
+
+    key = _request_key(req, mode)
+
+    async def factory():
+        holder = CaptureHolder()
+        options = _make_options(req, holder)
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        return client, holder
+
+    client, holder, warm = await pool.checkout(key, factory)
+    pool.schedule_refill(key, factory)   # replacement spawns while this request runs
+    holder.capture = capture
+
     logger.info(
-        "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d prompt_chars=%d",
-        req.model, mode, len(req.messages), n_tools, forced, eff_turns, len(user_prompt),
+        "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d warm=%s prompt_chars=%d",
+        req.model, mode, len(req.messages), n_tools, forced, eff_turns, warm, len(user_prompt),
     )
     logger.debug("tool_choice=%s response_format=%s prompt=%r",
                  req.tool_choice,
@@ -219,8 +284,20 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     t0 = time.perf_counter()
     text_chars = 0
     emitted_text = False
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(user_prompt)
+    try:
+        try:
+            await client.query(user_prompt)
+        except Exception as e:
+            if not warm:
+                raise
+            # stale warm client (process died while idle) — retry once cold
+            logger.warning("warm client stale (%s); retrying cold", e)
+            pool.schedule_retire(client)
+            client, holder = await factory()
+            holder.capture = capture
+            warm = False
+            await client.query(user_prompt)
+
         async for msg in client.receive_response():
             if isinstance(msg, StreamEvent):
                 # real token streaming: forward text_delta events as they arrive
@@ -243,9 +320,9 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
                     elif isinstance(block, ThinkingBlock):
                         logger.debug("thinking: %d chars", len(getattr(block, "thinking", "") or ""))
                     elif isinstance(block, ToolUseBlock):
-                        logger.info("assistant tool_use block: name=%s input=%s",
-                                    getattr(block, "name", "?"),
-                                    json.dumps(getattr(block, "input", {}))[:300])
+                        logger.debug("assistant tool_use block: name=%s input=%s",
+                                     getattr(block, "name", "?"),
+                                     json.dumps(getattr(block, "input", {}))[:300])
             elif isinstance(msg, SystemMessage):
                 logger.debug("system message: %s", getattr(msg, "subtype", ""))
             elif isinstance(msg, ResultMessage):
@@ -261,11 +338,14 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
                     getattr(msg, "total_cost_usd", "?"), capture.get("usage"),
                 )
                 if capture["structured_output"] is not None:
-                    logger.info("native structured_output present: %s",
-                                json.dumps(capture["structured_output"])[:300])
+                    logger.debug("native structured_output: %s",
+                                 json.dumps(capture["structured_output"])[:300])
                 if result_text:
                     logger.debug("result text: %r", str(result_text)[:400])
                 break
+    finally:
+        # single-use: every served client is retired (success, error, timeout, cancel)
+        pool.schedule_retire(client)
 
     calls = capture.get("calls") or []
     blocked = capture.get("blocked") or []

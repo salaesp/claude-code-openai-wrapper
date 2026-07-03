@@ -20,6 +20,7 @@ def _apply() -> None:
     """Recompute module-level settings from os.environ."""
     global API_KEY, DEFAULT_MODEL, EXPOSED_MODELS, MAX_TURNS, REQUEST_TIMEOUT
     global SINGLE_TURN, DISABLE_THINKING, TOOL_MAX_TURNS, CONCISE
+    global WARM_POOL, POOL_MAX_KEYS, POOL_TTL_S
     API_KEY = os.environ.get("WRAPPER_API_KEY", "changeme")
     DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
     EXPOSED_MODELS = os.environ.get(
@@ -35,6 +36,10 @@ def _apply() -> None:
     DISABLE_THINKING = os.environ.get("DISABLE_THINKING", "1") not in ("0", "false", "False")
     # Concise: suppress reasoning narration / step-by-step; answer directly.
     CONCISE = os.environ.get("CONCISE", "0") not in ("0", "false", "False")
+    # Warm pool: pre-spawned single-use CLI clients keyed by options hash.
+    WARM_POOL = os.environ.get("WARM_POOL", "1") not in ("0", "false", "False")
+    POOL_MAX_KEYS = int(os.environ.get("POOL_MAX_KEYS", "3"))
+    POOL_TTL_S = int(os.environ.get("POOL_TTL_S", "300"))
 
 
 def reload() -> None:

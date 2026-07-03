@@ -144,6 +144,16 @@ Other notes:
 - **Set log level to `DEBUG`** (in `/setup` or `LOG_LEVEL`) to see the prompt, per-block
   tool_use, and the SDK result text.
 
+## Performance
+
+A warm pool pre-spawns single-use CLI clients keyed by request shape (mode + model +
+schema + system prompt). The ~1.5–2.5s process-spawn cost moves off the request path:
+after each request, a replacement spawns in the background. Clients are never reused
+across requests (one CLI process = one conversation), so cross-request context bleed
+is structurally impossible. Tune with `WARM_POOL`, `POOL_MAX_KEYS`, `POOL_TTL_S`.
+Errors follow the OpenAI shape (`{"error": {"message","type","code"}}`), and
+`REQUEST_TIMEOUT` bounds every request.
+
 ## Known limitations
 
 - **No token usage counts** — subscription auth doesn't surface them; `usage` is zeros.

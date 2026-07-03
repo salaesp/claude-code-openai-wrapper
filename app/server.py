@@ -1,18 +1,22 @@
 """FastAPI app exposing an OpenAI-compatible surface over the Claude subscription."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import time
 import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import time as _time
 import uuid as _uuid
 
 from . import config
 from .log import configure as _log_configure, logger, request_id
+from .pool import pool
 from .setup import router as setup_router
 from .claude_backend import run
 from .models import (
@@ -24,8 +28,54 @@ from .models import (
 )
 
 _log_configure()
-app = FastAPI(title="Claude OpenAI-Compatible Wrapper", version="0.1.0")
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    sweeper = asyncio.create_task(pool.sweep_loop())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        await pool.shutdown()
+
+
+app = FastAPI(title="Claude OpenAI-Compatible Wrapper", version="0.1.0",
+              lifespan=_lifespan)
 app.include_router(setup_router)
+
+
+# ---- OpenAI-format errors (scoped to /v1; /setup keeps FastAPI defaults) ----
+
+def _openai_error(status: int, message: str, err_type: str, code) -> JSONResponse:
+    return JSONResponse(status_code=status, content={
+        "error": {"message": message, "type": err_type, "code": code}})
+
+
+@app.exception_handler(HTTPException)
+async def _http_exc(request: Request, exc: HTTPException):
+    if not request.url.path.startswith("/v1"):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    err_type = "authentication_error" if exc.status_code == 401 else "invalid_request_error"
+    return _openai_error(exc.status_code, str(exc.detail), err_type, exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exc(request: Request, exc: RequestValidationError):
+    if not request.url.path.startswith("/v1"):
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    first = exc.errors()[0] if exc.errors() else {}
+    loc = ".".join(str(p) for p in first.get("loc", []))
+    return _openai_error(400, f"Invalid request: {loc}: {first.get('msg', 'validation error')}",
+                         "invalid_request_error", 400)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exc(request: Request, exc: Exception):
+    logger.exception("unhandled error on %s", request.url.path)
+    if not request.url.path.startswith("/v1"):
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    return _openai_error(500, str(exc), "api_error", "internal_error")
 
 
 @app.middleware("http")
@@ -88,17 +138,23 @@ async def chat_completions(req: ChatCompletionRequest):
     return await _blocking(req)
 
 
-async def _blocking(req: ChatCompletionRequest) -> ChatCompletionResponse:
+async def _blocking(req: ChatCompletionRequest):
     text_parts: list[str] = []
     tool_calls = None
     usage = Usage()
-    async for kind, payload in run(req):
-        if kind == "text":
-            text_parts.append(payload)
-        elif kind == "tool_calls":
-            tool_calls = payload
-        elif kind == "usage":
-            usage = Usage(**payload)
+    try:
+        async with asyncio.timeout(config.REQUEST_TIMEOUT):
+            async for kind, payload in run(req):
+                if kind == "text":
+                    text_parts.append(payload)
+                elif kind == "tool_calls":
+                    tool_calls = payload
+                elif kind == "usage":
+                    usage = Usage(**payload)
+    except TimeoutError:
+        logger.warning("request timed out after %ss", config.REQUEST_TIMEOUT)
+        return _openai_error(504, f"Request timed out after {config.REQUEST_TIMEOUT}s",
+                             "timeout_error", "timeout")
 
     if tool_calls:
         msg = Message(role="assistant", content=None, tool_calls=tool_calls)
@@ -138,24 +194,31 @@ async def _stream(req: ChatCompletionRequest):
     finish = "stop"
     usage = None
     try:
-        async for kind, payload in run(req):
-            if kind == "text" and payload:
-                yield chunk({"content": payload})
-            elif kind == "tool_calls":
-                for i, tc in enumerate(payload):
-                    yield chunk({
-                        "tool_calls": [{
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": tc["function"],
-                        }]
-                    })
-                finish = "tool_calls"
-            elif kind == "usage":
-                usage = payload
+        async with asyncio.timeout(config.REQUEST_TIMEOUT):
+            async for kind, payload in run(req):
+                if kind == "text" and payload:
+                    yield chunk({"content": payload})
+                elif kind == "tool_calls":
+                    for i, tc in enumerate(payload):
+                        yield chunk({
+                            "tool_calls": [{
+                                "index": i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": tc["function"],
+                            }]
+                        })
+                    finish = "tool_calls"
+                elif kind == "usage":
+                    usage = payload
+    except TimeoutError:
+        logger.warning("stream timed out after %ss", config.REQUEST_TIMEOUT)
+        yield "data: " + json.dumps({"error": {
+            "message": f"Request timed out after {config.REQUEST_TIMEOUT}s",
+            "type": "timeout_error", "code": "timeout"}}) + "\n\n"
     except Exception as e:  # surface backend errors inside the stream
-        yield chunk({"content": f"\n[wrapper error: {e}]"})
+        yield "data: " + json.dumps({"error": {
+            "message": str(e), "type": "api_error", "code": "internal_error"}}) + "\n\n"
 
     yield chunk({}, finish=finish)
     # final usage-only chunk (OpenAI include_usage style)
