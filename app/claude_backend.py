@@ -178,6 +178,7 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
         system_prompt=_with_guardrail(system_prompt),
         max_turns=1 if config.SINGLE_TURN else config.MAX_TURNS,
         can_use_tool=deny_all,
+        include_partial_messages=True,   # emit StreamEvent text deltas for real streaming
     ))
 
 
@@ -205,12 +206,14 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
 
     from claude_agent_sdk import (
         AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock,
-        SystemMessage, ResultMessage,
+        SystemMessage, ResultMessage, StreamEvent,
     )
 
     # For tool/structured requests, buffer text instead of streaming it: any text
     # before a captured tool call is just ToolSearch preamble and must be dropped.
     buffering = mode != "chat"
+    # chat streams token deltas live via StreamEvent; buf is a fallback if none arrive
+    stream_text = mode == "chat"
     buf: list[str] = []
 
     t0 = time.perf_counter()
@@ -219,15 +222,24 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     async with ClaudeSDKClient(options=options) as client:
         await client.query(user_prompt)
         async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
+            if isinstance(msg, StreamEvent):
+                # real token streaming: forward text_delta events as they arrive
+                if stream_text:
+                    ev = msg.event or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            emitted_text = True
+                            text_chars += len(delta["text"])
+                            yield ("text", delta["text"])
+            elif isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock) and block.text:
-                        text_chars += len(block.text)
-                        if buffering:
+                        if stream_text:
+                            buf.append(block.text)   # fallback only; deltas already sent
+                        elif buffering:
+                            text_chars += len(block.text)
                             buf.append(block.text)
-                        else:
-                            emitted_text = True
-                            yield ("text", block.text)
                     elif isinstance(block, ThinkingBlock):
                         logger.debug("thinking: %d chars", len(getattr(block, "thinking", "") or ""))
                     elif isinstance(block, ToolUseBlock):
@@ -301,10 +313,10 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
             mode, capture.get("stop_reason"), blocked or "-", len(" ".join(buf)),
         )
 
-    # emit buffered text (tool/structured fallback) or the empty terminator
+    # emit buffered text (tool fallback) or, for chat, the fallback if no deltas streamed
     if buffering:
-        text = "".join(buf)
-        yield ("text", text)
+        yield ("text", "".join(buf))
     elif not emitted_text:
-        yield ("text", "")
+        # chat produced no StreamEvent deltas -> emit the complete text (or empty)
+        yield ("text", "".join(buf))
     yield ("done", None)
