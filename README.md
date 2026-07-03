@@ -123,16 +123,26 @@ bake into the image or commit `.env`.
 
 ## Behavior notes
 
-- **Tools & structured output cost an internal `ToolSearch` round-trip.** This Claude
-  Code build registers MCP tools as *deferred* — the model calls a built-in `ToolSearch`
-  to load our tool, then calls it. So these requests take ~4 internal turns and extra
-  prompt tokens. Unavoidable with the current CLI. Plain chat skips it entirely.
-- **`SINGLE_TURN` is chat-only.** Tool/structured requests always get full `CLAUDE_MAX_TURNS`
-  so the ToolSearch step can complete; forcing 1 turn there returns empty responses.
-- **`error=True` in `result:` logs is expected for tool/structured calls** — we capture the
-  model's tool call by denying+interrupting it, which the SDK records as an error. The
-  response is still correct.
-- **Set `LOG_LEVEL=DEBUG`** to see the prompt, per-block tool_use, and the SDK result text.
+Three request modes, each tuned differently (all configurable in `/setup`):
+
+- **Plain chat** — single turn, one prompt → one response. No tools, no ToolSearch.
+- **Structured output** (`response_format`) — uses the CLI's **native** `--json-schema`
+  output. No MCP tool, no ToolSearch; the JSON comes back in `structured_output` and is
+  returned as the message content. Clean and reliable.
+- **Passthrough function tools** (OpenAI `tools`) — the only mode that pays an internal
+  `ToolSearch` round-trip: this CLI registers MCP tools as *deferred*, so the model calls
+  `ToolSearch` to load the tool, then calls it (~4 turns). Inherent to function-calling
+  passthrough; bounded by the **Tool/structured turn limit** (`TOOL_MAX_TURNS`, default 5).
+
+Other notes:
+
+- **`SINGLE_TURN` is chat-only.** Tool/structured requests use `TOOL_MAX_TURNS` so their
+  internal steps can complete; forcing 1 turn there returns empty responses.
+- **`error=True` in `result:` logs is expected for passthrough tool calls** — we capture
+  the model's tool call by denying+interrupting it, which the SDK records as an error. The
+  response is still correct. (Structured mode logs `error=False`.)
+- **Set log level to `DEBUG`** (in `/setup` or `LOG_LEVEL`) to see the prompt, per-block
+  tool_use, and the SDK result text.
 
 ## Known limitations
 

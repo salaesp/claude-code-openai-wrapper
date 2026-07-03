@@ -13,6 +13,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from . import config
+from .log import configure as log_reconfigure
 
 router = APIRouter()
 
@@ -60,9 +61,9 @@ body{margin:0;min-height:100vh;font:400 15px/1.5 Roboto,system-ui,sans-serif;
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;
  padding:6px 14px;border-radius:100px;background:var(--primary-container);color:var(--on-primary-container);margin-bottom:20px}
 .field{position:relative;margin:26px 0}
-.field input{width:100%;padding:16px;font:inherit;color:var(--on-surface);background:transparent;
+.field input,.field select{width:100%;padding:16px;font:inherit;color:var(--on-surface);background:var(--surface-container);
  border:1px solid var(--outline);border-radius:12px;outline:none}
-.field input:focus{border:2px solid var(--primary);padding:15px}
+.field input:focus,.field select:focus{border:2px solid var(--primary);padding:15px}
 .field label{position:absolute;top:-9px;left:12px;padding:0 6px;font-size:12px;
  background:var(--surface-container);color:var(--on-surface-variant)}
 .field input:focus+label{color:var(--primary)}
@@ -125,15 +126,35 @@ claude setup-token</div>
    <label class=sw><input type=checkbox name=disable_thinking value=1 {think_checked}><span></span></label>
   </div>
 
+  <div class=field>
+   <input id=tmt name=tool_max_turns type=number min=2 max=20 value="{tool_max_turns}">
+   <label for=tmt>Tool / structured turn limit</label>
+  </div>
+  <div class=hint>Ceiling for tool &amp; structured requests (they need a few internal turns). Lower = less agentic wandering.</div>
+
+  <div class=field>
+   <select id=ll name=log_level>{log_options}</select>
+   <label for=ll>Log level</label>
+  </div>
+  <div class=hint>DEBUG shows prompts &amp; per-block traces; INFO shows request/result/usage.</div>
+
   <button class=btn type=submit>Save configuration</button>
  </form>
 </div></div>
 <script>function g(){{const h='0123456789abcdef';let s='sk-local-';for(let i=0;i<32;i++)s+=h[Math.floor(Math.random()*16)];document.getElementById('wk').value=s;}}</script>
 </body></html>"""
 
+_LOG_LEVELS = ["INFO", "DEBUG", "WARNING", "ERROR"]
+
+
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_form():
     configured = config.is_configured()
+    current_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_options = "".join(
+        f'<option value="{lv}"{" selected" if lv == current_level else ""}>{lv}</option>'
+        for lv in _LOG_LEVELS
+    )
     return _FORM.format(
         style=_STYLE,
         chip="✓ Configured — edit anytime" if configured else "First-run setup",
@@ -142,6 +163,8 @@ async def setup_form():
         model=config.DEFAULT_MODEL,
         single_checked="checked" if config.SINGLE_TURN else "",
         think_checked="checked" if config.DISABLE_THINKING else "",
+        tool_max_turns=config.TOOL_MAX_TURNS,
+        log_options=log_options,
     )
 
 
@@ -153,16 +176,26 @@ async def setup_save(
     model: str = Form("claude-opus-4-8"),
     single_turn: str = Form("0"),      # checkbox: present ("1") only when checked
     disable_thinking: str = Form("0"),
+    tool_max_turns: str = Form("5"),
+    log_level: str = Form("INFO"),
 ):
     if not oauth_token and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         raise HTTPException(status_code=400, detail="Subscription token required on first setup")
+    try:
+        turns = max(2, min(20, int(tool_max_turns)))
+    except ValueError:
+        turns = 5
+    level = log_level.upper() if log_level.upper() in _LOG_LEVELS else "INFO"
     _persist({
         "WRAPPER_API_KEY": wrapper_key,
         "CLAUDE_CODE_OAUTH_TOKEN": oauth_token,
         "CLAUDE_MODEL": model,
         "SINGLE_TURN": "1" if single_turn == "1" else "0",
         "DISABLE_THINKING": "1" if disable_thinking == "1" else "0",
+        "TOOL_MAX_TURNS": str(turns),
+        "LOG_LEVEL": level,
     })
+    log_reconfigure()  # apply new log level live
     return _SAVED.format(style=_STYLE, key=wrapper_key, model=model)
 
 

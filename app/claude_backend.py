@@ -40,7 +40,6 @@ from .translate import build_prompt
 
 MCP_SERVER = "openai"
 TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
-STRUCTURED_TOOL = "respond_with_structured_output"
 
 
 def _extract_usage(usage) -> dict:
@@ -65,89 +64,95 @@ def _gen_id(prefix: str, n: int) -> str:
     return f"{prefix}_{abs(hash((prefix, n))) % (10**12):012d}"
 
 
+BUILTIN_TOOLS = ["Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch",
+                 "Glob", "Grep", "LS", "Task", "NotebookEdit"]
+
+
 def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptions:
-    """Build SDK options: register tools + install the capture permission hook."""
+    """Build SDK options. Three modes:
+
+    - structured: native --json-schema output (no MCP, no ToolSearch, single exchange)
+    - tools:      passthrough via MCP + can_use_tool capture (needs ToolSearch turns)
+    - chat:       plain model call, single turn
+    """
     system_prompt, _ = build_prompt(req.messages)
+    is_structured = bool(req.response_format and req.response_format.type in ("json_schema", "json_object"))
 
-    sdk_tools = []
-    tool_names: list[str] = []
+    base: dict[str, Any] = dict(
+        setting_sources=[],
+        permission_mode="default",
+        disallowed_tools=BUILTIN_TOOLS,
+    )
+    if config.DISABLE_THINKING:
+        base["thinking"] = {"type": "disabled"}
+    if req.model:
+        base["model"] = req.model
 
-    # --- structured output mode: one forced schema tool ---
-    if req.response_format and req.response_format.type in ("json_schema", "json_object"):
+    def build(opts: dict) -> ClaudeAgentOptions:
+        merged = {**base, **opts}
+        return ClaudeAgentOptions(**{k: v for k, v in merged.items() if v is not None})
+
+    # === structured output: native, no tools, one answer ===
+    if is_structured:
         schema = {"type": "object"}
         if req.response_format.type == "json_schema" and req.response_format.json_schema:
             schema = req.response_format.json_schema.get("schema", schema)
+        logger.debug("structured native output_format schema=%s", json.dumps(schema)[:300])
+        return build(dict(
+            output_format={"type": "json_schema", "schema": schema},
+            allowed_tools=[],   # no tools -> model answers directly from the prompt
+            max_turns=config.TOOL_MAX_TURNS,   # native StructuredOutput uses ~2 turns
+            system_prompt=(system_prompt + "\n\nAnswer only from the conversation above. "
+                           "Do not use any tools. Return the structured result directly.").strip(),
+        ))
 
-        @tool(STRUCTURED_TOOL, "Return the final answer as structured JSON.", schema)
-        async def _structured(args):  # never actually runs; intercepted
-            return {"content": [{"type": "text", "text": "ok"}]}
+    # === passthrough function tools ===
+    if req.tools:
+        sdk_tools, tool_names = [], []
+        for t in req.tools:
+            name = t.function.name
+            tschema = t.function.parameters or {"type": "object"}
 
-        sdk_tools.append(_structured)
-        tool_names.append(TOOL_PREFIX + STRUCTURED_TOOL)
-        system_prompt += (
-            f"\n\nYou MUST answer by calling the `{STRUCTURED_TOOL}` tool exactly once "
-            "with arguments matching its schema. Do not write a normal text reply."
-        )
+            @tool(name, t.function.description or name, tschema)
+            async def _passthrough(args):  # intercepted before execution
+                return {"content": [{"type": "text", "text": "ok"}]}
 
-    # --- passthrough function tools ---
-    for t in req.tools or []:
-        name = t.function.name
-        schema = t.function.parameters or {"type": "object"}
+            sdk_tools.append(_passthrough)
+            tool_names.append(TOOL_PREFIX + name)
 
-        @tool(name, t.function.description or name, schema)
-        async def _passthrough(args):  # intercepted before execution
-            return {"content": [{"type": "text", "text": "ok"}]}
+        forced = req.tool_choice in ("required", "any") or isinstance(req.tool_choice, dict)
+        if forced:
+            system_prompt += "\n\nYou MUST call one of the provided tools to respond."
+        server = create_sdk_mcp_server(name=MCP_SERVER, tools=sdk_tools)
+        logger.debug("registered passthrough tools: %s", tool_names)
 
-        sdk_tools.append(_passthrough)
-        tool_names.append(TOOL_PREFIX + name)
+        async def can_use_tool(tool_name: str, tool_input: dict, ctx) -> Any:
+            if tool_name.startswith(TOOL_PREFIX):
+                short = tool_name[len(TOOL_PREFIX):]
+                capture.setdefault("calls", []).append({"name": short, "args": tool_input})
+                logger.info("captured tool_call: %s args=%s", short, json.dumps(tool_input)[:400])
+                return PermissionResultDeny(behavior="deny", message="captured", interrupt=True)
+            capture.setdefault("blocked", []).append(tool_name)
+            logger.warning("blocked non-passthrough tool: %s", tool_name)
+            return PermissionResultDeny(behavior="deny", message="tool disabled", interrupt=True)
 
-    forced = req.tool_choice in ("required", "any") or (
-        isinstance(req.tool_choice, dict)
-    )
-    if forced and req.tools:
-        system_prompt += "\n\nYou MUST call one of the provided tools to respond."
+        return build(dict(
+            system_prompt=system_prompt or None,
+            max_turns=config.TOOL_MAX_TURNS,   # ToolSearch round-trip needs a few turns
+            can_use_tool=can_use_tool,
+            mcp_servers={MCP_SERVER: server},
+        ))
 
-    server = create_sdk_mcp_server(name=MCP_SERVER, tools=sdk_tools) if sdk_tools else None
-    logger.debug("registered tools: %s", tool_names or "(none)")
-
-    async def can_use_tool(tool_name: str, tool_input: dict, ctx) -> Any:
-        if tool_name.startswith(TOOL_PREFIX):
-            short = tool_name[len(TOOL_PREFIX):]
-            capture.setdefault("calls", []).append({"name": short, "args": tool_input})
-            logger.info("captured tool_call: %s args=%s", short, json.dumps(tool_input)[:400])
-            # stop the agent immediately; we hand control back to the OpenAI client
-            return PermissionResultDeny(
-                behavior="deny", message="captured by wrapper", interrupt=True
-            )
-        # a tool we did not register — Claude tried to use its own agent tooling
+    # === plain chat: single turn ===
+    async def deny_all(tool_name, tool_input, ctx):
         capture.setdefault("blocked", []).append(tool_name)
-        logger.warning("blocked non-passthrough tool: %s args=%s", tool_name, json.dumps(tool_input)[:200])
-        return PermissionResultDeny(
-            behavior="deny", message="tool disabled", interrupt=True
-        )
+        return PermissionResultDeny(behavior="deny", message="tool disabled", interrupt=True)
 
-    # Tools/structured need extra turns: this CLI loads MCP tools via a ToolSearch
-    # round-trip first, so a hard max_turns=1 would cut off before the real call.
-    needs_tools = bool(sdk_tools)
-    max_turns = config.MAX_TURNS if needs_tools else (1 if config.SINGLE_TURN else config.MAX_TURNS)
-
-    opts: dict[str, Any] = dict(
+    return build(dict(
         system_prompt=system_prompt or None,
-        # single-turn only applies to plain chat; don't load CLAUDE.md/user settings
-        max_turns=max_turns,
-        setting_sources=[],
-        can_use_tool=can_use_tool,
-        permission_mode="default",
-        disallowed_tools=["Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch"],
-    )
-    if config.DISABLE_THINKING:
-        opts["thinking"] = {"type": "disabled"}  # SDK expects a dict, not the TypedDict ctor
-    if server:
-        opts["mcp_servers"] = {MCP_SERVER: server}
-    if req.model:
-        opts["model"] = req.model
-    # keep falsy-but-meaningful values (e.g. setting_sources=[]) — only drop None
-    return ClaudeAgentOptions(**{k: v for k, v in opts.items() if v is not None})
+        max_turns=1 if config.SINGLE_TURN else config.MAX_TURNS,
+        can_use_tool=deny_all,
+    ))
 
 
 async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
@@ -161,8 +166,8 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
            ("tools" if n_tools else "chat")
     forced = req.tool_choice in ("required", "any") or isinstance(req.tool_choice, dict) \
         or mode == "structured"
-    # tools/structured always get full turns (ToolSearch round-trip); single-turn is chat-only
-    eff_turns = config.MAX_TURNS if mode != "chat" else (1 if config.SINGLE_TURN else config.MAX_TURNS)
+    # tools/structured use TOOL_MAX_TURNS; single-turn applies to plain chat only
+    eff_turns = config.TOOL_MAX_TURNS if mode != "chat" else (1 if config.SINGLE_TURN else config.MAX_TURNS)
     logger.info(
         "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d prompt_chars=%d",
         req.model, mode, len(req.messages), n_tools, forced, eff_turns, len(user_prompt),
@@ -226,8 +231,9 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
 
     calls = capture.get("calls") or []
     blocked = capture.get("blocked") or []
+    structured = capture.get("structured_output")
     elapsed = (time.perf_counter() - t0) * 1000
-    outcome = "tool_calls" if (calls and calls[0]["name"] != STRUCTURED_TOOL) else "text"
+    outcome = "structured" if mode == "structured" else ("tool_calls" if calls else "text")
     logger.info("done: outcome=%s text_chars=%d captured=%d blocked=%d elapsed=%.0fms",
                 outcome, text_chars, len(calls), len(blocked), elapsed)
 
@@ -235,9 +241,14 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     if usage:
         yield ("usage", usage)
 
-    # structured output -> return JSON as content, not as a tool_call
-    if calls and calls[0]["name"] == STRUCTURED_TOOL:
-        yield ("text", json.dumps(calls[0]["args"]))
+    # structured output -> native JSON from the CLI, returned as message content
+    if mode == "structured":
+        if structured is not None:
+            yield ("text", json.dumps(structured))
+        else:
+            logger.warning("structured request produced no structured_output (stop=%s); "
+                           "falling back to buffered text", capture.get("stop_reason"))
+            yield ("text", "".join(buf))
         yield ("done", None)
         return
 
