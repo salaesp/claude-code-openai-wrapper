@@ -108,26 +108,33 @@ def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptio
         system_prompt += "\n\nYou MUST call one of the provided tools to respond."
 
     server = create_sdk_mcp_server(name=MCP_SERVER, tools=sdk_tools) if sdk_tools else None
+    logger.debug("registered tools: %s", tool_names or "(none)")
 
     async def can_use_tool(tool_name: str, tool_input: dict, ctx) -> Any:
         if tool_name.startswith(TOOL_PREFIX):
             short = tool_name[len(TOOL_PREFIX):]
             capture.setdefault("calls", []).append({"name": short, "args": tool_input})
-            logger.info("captured tool_call: %s(%s)", short, json.dumps(tool_input))
+            logger.info("captured tool_call: %s args=%s", short, json.dumps(tool_input)[:400])
             # stop the agent immediately; we hand control back to the OpenAI client
             return PermissionResultDeny(
                 behavior="deny", message="captured by wrapper", interrupt=True
             )
-        # pure model endpoint: no built-in tools
-        logger.warning("blocked built-in tool attempt: %s", tool_name)
+        # a tool we did not register — Claude tried to use its own agent tooling
+        capture.setdefault("blocked", []).append(tool_name)
+        logger.warning("blocked non-passthrough tool: %s args=%s", tool_name, json.dumps(tool_input)[:200])
         return PermissionResultDeny(
             behavior="deny", message="tool disabled", interrupt=True
         )
 
+    # Tools/structured need extra turns: this CLI loads MCP tools via a ToolSearch
+    # round-trip first, so a hard max_turns=1 would cut off before the real call.
+    needs_tools = bool(sdk_tools)
+    max_turns = config.MAX_TURNS if needs_tools else (1 if config.SINGLE_TURN else config.MAX_TURNS)
+
     opts: dict[str, Any] = dict(
         system_prompt=system_prompt or None,
-        # one prompt -> one response: cap turns, don't load CLAUDE.md/user settings
-        max_turns=1 if config.SINGLE_TURN else config.MAX_TURNS,
+        # single-turn only applies to plain chat; don't load CLAUDE.md/user settings
+        max_turns=max_turns,
         setting_sources=[],
         can_use_tool=can_use_tool,
         permission_mode="default",
@@ -152,15 +159,28 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     n_tools = len(req.tools or [])
     mode = "structured" if req.response_format and req.response_format.type != "text" else \
            ("tools" if n_tools else "chat")
+    forced = req.tool_choice in ("required", "any") or isinstance(req.tool_choice, dict) \
+        or mode == "structured"
+    # tools/structured always get full turns (ToolSearch round-trip); single-turn is chat-only
+    eff_turns = config.MAX_TURNS if mode != "chat" else (1 if config.SINGLE_TURN else config.MAX_TURNS)
     logger.info(
-        "request: model=%s mode=%s messages=%d tools=%d prompt_chars=%d",
-        req.model, mode, len(req.messages), n_tools, len(user_prompt),
+        "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d prompt_chars=%d",
+        req.model, mode, len(req.messages), n_tools, forced, eff_turns, len(user_prompt),
     )
+    logger.debug("tool_choice=%s response_format=%s prompt=%r",
+                 req.tool_choice,
+                 req.response_format.type if req.response_format else None,
+                 user_prompt[:800])
 
     from claude_agent_sdk import (
         AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock,
         SystemMessage, ResultMessage,
     )
+
+    # For tool/structured requests, buffer text instead of streaming it: any text
+    # before a captured tool call is just ToolSearch preamble and must be dropped.
+    buffering = mode != "chat"
+    buf: list[str] = []
 
     t0 = time.perf_counter()
     text_chars = 0
@@ -171,30 +191,45 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock) and block.text:
-                        emitted_text = True
                         text_chars += len(block.text)
-                        yield ("text", block.text)
+                        if buffering:
+                            buf.append(block.text)
+                        else:
+                            emitted_text = True
+                            yield ("text", block.text)
                     elif isinstance(block, ThinkingBlock):
                         logger.debug("thinking: %d chars", len(getattr(block, "thinking", "") or ""))
                     elif isinstance(block, ToolUseBlock):
-                        logger.debug("assistant issued tool_use: %s", getattr(block, "name", "?"))
+                        logger.info("assistant tool_use block: name=%s input=%s",
+                                    getattr(block, "name", "?"),
+                                    json.dumps(getattr(block, "input", {}))[:300])
             elif isinstance(msg, SystemMessage):
                 logger.debug("system message: %s", getattr(msg, "subtype", ""))
             elif isinstance(msg, ResultMessage):
                 capture["usage"] = _extract_usage(getattr(msg, "usage", None))
+                capture["stop_reason"] = getattr(msg, "stop_reason", None)
+                capture["structured_output"] = getattr(msg, "structured_output", None)
+                denials = getattr(msg, "permission_denials", None) or []
+                result_text = getattr(msg, "result", None)
                 logger.info(
-                    "result: turns=%s duration=%sms api=%sms error=%s cost=$%s tokens=%s",
-                    getattr(msg, "num_turns", "?"), getattr(msg, "duration_ms", "?"),
-                    getattr(msg, "duration_api_ms", "?"), getattr(msg, "is_error", "?"),
+                    "result: turns=%s stop=%s error=%s denials=%d cost=$%s tokens=%s",
+                    getattr(msg, "num_turns", "?"), capture["stop_reason"],
+                    getattr(msg, "is_error", "?"), len(denials),
                     getattr(msg, "total_cost_usd", "?"), capture.get("usage"),
                 )
+                if capture["structured_output"] is not None:
+                    logger.info("native structured_output present: %s",
+                                json.dumps(capture["structured_output"])[:300])
+                if result_text:
+                    logger.debug("result text: %r", str(result_text)[:400])
                 break
 
     calls = capture.get("calls") or []
+    blocked = capture.get("blocked") or []
     elapsed = (time.perf_counter() - t0) * 1000
     outcome = "tool_calls" if (calls and calls[0]["name"] != STRUCTURED_TOOL) else "text"
-    logger.info("done: outcome=%s text_chars=%d captured=%d elapsed=%.0fms",
-                outcome, text_chars, len(calls), elapsed)
+    logger.info("done: outcome=%s text_chars=%d captured=%d blocked=%d elapsed=%.0fms",
+                outcome, text_chars, len(calls), len(blocked), elapsed)
 
     usage = capture.get("usage")
     if usage:
@@ -221,6 +256,18 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         yield ("tool_calls", tool_calls)
         return
 
-    if not emitted_text:
+    # no tool captured. If this was a forced request, that's a failure worth flagging.
+    if forced:
+        logger.warning(
+            "FORCED but no tool captured. mode=%s stop=%s blocked=%s buffered_chars=%d. "
+            "Falling back to buffered text (may not satisfy the client's schema).",
+            mode, capture.get("stop_reason"), blocked or "-", len(" ".join(buf)),
+        )
+
+    # emit buffered text (tool/structured fallback) or the empty terminator
+    if buffering:
+        text = "".join(buf)
+        yield ("text", text)
+    elif not emitted_text:
         yield ("text", "")
     yield ("done", None)

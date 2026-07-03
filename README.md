@@ -121,6 +121,19 @@ docker run -p 8000:8000 \
 `CLAUDE_CODE_OAUTH_TOKEN` grants full account access — inject at runtime only, never
 bake into the image or commit `.env`.
 
+## Behavior notes
+
+- **Tools & structured output cost an internal `ToolSearch` round-trip.** This Claude
+  Code build registers MCP tools as *deferred* — the model calls a built-in `ToolSearch`
+  to load our tool, then calls it. So these requests take ~4 internal turns and extra
+  prompt tokens. Unavoidable with the current CLI. Plain chat skips it entirely.
+- **`SINGLE_TURN` is chat-only.** Tool/structured requests always get full `CLAUDE_MAX_TURNS`
+  so the ToolSearch step can complete; forcing 1 turn there returns empty responses.
+- **`error=True` in `result:` logs is expected for tool/structured calls** — we capture the
+  model's tool call by denying+interrupting it, which the SDK records as an error. The
+  response is still correct.
+- **Set `LOG_LEVEL=DEBUG`** to see the prompt, per-block tool_use, and the SDK result text.
+
 ## Known limitations
 
 - **No token usage counts** — subscription auth doesn't surface them; `usage` is zeros.
