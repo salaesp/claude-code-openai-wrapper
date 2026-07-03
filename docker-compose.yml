@@ -1,0 +1,18 @@
+services:
+  claude-openai:
+    build: .
+    ports:
+      # host port configurable: PORT=9999 docker compose up
+      - "${PORT:-8000}:8000"
+    environment:
+      # All optional now — leave blank and use the /setup page instead.
+      # Anything set here still works and takes precedence over persisted values.
+      WRAPPER_API_KEY: ${WRAPPER_API_KEY:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-opus-4-8}
+      CLAUDE_MAX_TURNS: ${CLAUDE_MAX_TURNS:-8}
+      # /setup writes secrets here; the volume persists them across restarts.
+      CONFIG_FILE: /app/data/config.env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
