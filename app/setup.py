@@ -125,6 +125,11 @@ claude setup-token</div>
     <div class=thint>Skip extended reasoning before the answer.</div></div>
    <label class=sw><input type=checkbox name=disable_thinking value=1 {think_checked}><span></span></label>
   </div>
+  <div class=toggle>
+   <div><div class=tlabel>Concise answers</div>
+    <div class=thint>Suppress reasoning narration &amp; step-by-step; answer directly.</div></div>
+   <label class=sw><input type=checkbox name=concise value=1 {concise_checked}><span></span></label>
+  </div>
 
   <div class=field>
    <input id=tmt name=tool_max_turns type=number min=2 max=20 value="{tool_max_turns}">
@@ -163,6 +168,7 @@ async def setup_form():
         model=config.DEFAULT_MODEL,
         single_checked="checked" if config.SINGLE_TURN else "",
         think_checked="checked" if config.DISABLE_THINKING else "",
+        concise_checked="checked" if config.CONCISE else "",
         tool_max_turns=config.TOOL_MAX_TURNS,
         log_options=log_options,
     )
@@ -176,6 +182,7 @@ async def setup_save(
     model: str = Form("claude-opus-4-8"),
     single_turn: str = Form("0"),      # checkbox: present ("1") only when checked
     disable_thinking: str = Form("0"),
+    concise: str = Form("0"),
     tool_max_turns: str = Form("5"),
     log_level: str = Form("INFO"),
 ):
@@ -192,6 +199,7 @@ async def setup_save(
         "CLAUDE_MODEL": model,
         "SINGLE_TURN": "1" if single_turn == "1" else "0",
         "DISABLE_THINKING": "1" if disable_thinking == "1" else "0",
+        "CONCISE": "1" if concise == "1" else "0",
         "TOOL_MAX_TURNS": str(turns),
         "LOG_LEVEL": level,
     })

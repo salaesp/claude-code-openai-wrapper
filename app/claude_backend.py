@@ -80,8 +80,18 @@ LLM_GUARDRAIL = (
 )
 
 
+CONCISE_DIRECTIVE = (
+    "Respond with the final answer directly and concisely. Do not narrate your reasoning, "
+    "show step-by-step work, or add verification unless the user explicitly asks for it."
+)
+
+
 def _with_guardrail(system_prompt: str) -> str:
-    return (system_prompt + "\n\n" + LLM_GUARDRAIL).strip() if system_prompt else LLM_GUARDRAIL
+    parts = [system_prompt.strip()] if system_prompt else []
+    parts.append(LLM_GUARDRAIL)
+    if config.CONCISE:
+        parts.append(CONCISE_DIRECTIVE)
+    return "\n\n".join(parts)
 
 
 def _make_options(req: ChatCompletionRequest, capture: dict) -> ClaudeAgentOptions:

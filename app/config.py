@@ -19,7 +19,7 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", "")
 def _apply() -> None:
     """Recompute module-level settings from os.environ."""
     global API_KEY, DEFAULT_MODEL, EXPOSED_MODELS, MAX_TURNS, REQUEST_TIMEOUT
-    global SINGLE_TURN, DISABLE_THINKING, TOOL_MAX_TURNS
+    global SINGLE_TURN, DISABLE_THINKING, TOOL_MAX_TURNS, CONCISE
     API_KEY = os.environ.get("WRAPPER_API_KEY", "changeme")
     DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
     EXPOSED_MODELS = os.environ.get(
@@ -33,6 +33,8 @@ def _apply() -> None:
     # LLM mode: behave like a plain model (one prompt -> one response), not an agent.
     SINGLE_TURN = os.environ.get("SINGLE_TURN", "1") not in ("0", "false", "False")
     DISABLE_THINKING = os.environ.get("DISABLE_THINKING", "1") not in ("0", "false", "False")
+    # Concise: suppress reasoning narration / step-by-step; answer directly.
+    CONCISE = os.environ.get("CONCISE", "0") not in ("0", "false", "False")
 
 
 def reload() -> None:
