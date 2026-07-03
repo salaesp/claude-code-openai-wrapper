@@ -21,6 +21,7 @@ def _apply() -> None:
     global API_KEY, DEFAULT_MODEL, EXPOSED_MODELS, MAX_TURNS, REQUEST_TIMEOUT
     global SINGLE_TURN, DISABLE_THINKING, TOOL_MAX_TURNS, CONCISE
     global WARM_POOL, POOL_MAX_KEYS, POOL_TTL_S
+    global STRUCTURED_MAX_TURNS, STRUCTURED_RETRIES
     API_KEY = os.environ.get("WRAPPER_API_KEY", "changeme")
     DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
     EXPOSED_MODELS = os.environ.get(
@@ -30,6 +31,11 @@ def _apply() -> None:
     # Ceiling for tool/structured requests: enough for the ToolSearch round-trip
     # (~4 turns) plus a little slack. Lower = less room for agentic wandering.
     TOOL_MAX_TURNS = int(os.environ.get("TOOL_MAX_TURNS", "5"))
+    # Structured output can need extra turns to self-correct when its first
+    # StructuredOutput call fails schema validation.
+    STRUCTURED_MAX_TURNS = int(os.environ.get("STRUCTURED_MAX_TURNS", "10"))
+    # Whole-request retries when structured output comes back empty (fresh process).
+    STRUCTURED_RETRIES = int(os.environ.get("STRUCTURED_RETRIES", "2"))
     REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "180"))
     # LLM mode: behave like a plain model (one prompt -> one response), not an agent.
     SINGLE_TURN = os.environ.get("SINGLE_TURN", "1") not in ("0", "false", "False")

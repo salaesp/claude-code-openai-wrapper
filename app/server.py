@@ -151,6 +151,8 @@ async def _blocking(req: ChatCompletionRequest):
                     tool_calls = payload
                 elif kind == "usage":
                     usage = Usage(**payload)
+                elif kind == "error":
+                    return _openai_error(502, payload["message"], payload["type"], payload["code"])
     except TimeoutError:
         logger.warning("request timed out after %ss", config.REQUEST_TIMEOUT)
         return _openai_error(504, f"Request timed out after {config.REQUEST_TIMEOUT}s",
@@ -211,6 +213,8 @@ async def _stream(req: ChatCompletionRequest):
                     finish = "tool_calls"
                 elif kind == "usage":
                     usage = payload
+                elif kind == "error":
+                    yield "data: " + json.dumps({"error": payload}) + "\n\n"
     except TimeoutError:
         logger.warning("stream timed out after %ss", config.REQUEST_TIMEOUT)
         yield "data: " + json.dumps({"error": {

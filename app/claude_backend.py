@@ -173,11 +173,17 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
         if req.response_format.type == "json_schema" and req.response_format.json_schema:
             schema = req.response_format.json_schema.get("schema", schema)
         logger.debug("structured native output_format schema=%s", json.dumps(schema)[:300])
+        directive = (
+            "\n\nReturn your answer by producing a single JSON object that strictly "
+            "matches the required schema — correct field names, types, enums, and all "
+            "required fields. Do not write any explanation, preamble, or commentary; "
+            "emit only the structured result."
+        )
         return build(dict(
             output_format={"type": "json_schema", "schema": schema},
             allowed_tools=[],   # no tools -> model answers directly from the prompt
-            max_turns=config.TOOL_MAX_TURNS,   # native StructuredOutput uses ~2 turns
-            system_prompt=_with_guardrail(system_prompt) + "\n\nReturn the structured result directly.",
+            max_turns=config.STRUCTURED_MAX_TURNS,   # room to self-correct on schema misses
+            system_prompt=_with_guardrail(system_prompt) + directive,
         ))
 
     # === passthrough function tools ===
@@ -258,7 +264,6 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
 
     client, holder, warm = await pool.checkout(key, factory)
     pool.schedule_refill(key, factory)   # replacement spawns while this request runs
-    holder.capture = capture
 
     logger.info(
         "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d warm=%s prompt_chars=%d",
@@ -284,68 +289,89 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     t0 = time.perf_counter()
     text_chars = 0
     emitted_text = False
-    try:
-        try:
-            await client.query(user_prompt)
-        except Exception as e:
-            if not warm:
-                raise
-            # stale warm client (process died while idle) — retry once cold
-            logger.warning("warm client stale (%s); retrying cold", e)
-            pool.schedule_retire(client)
-            client, holder = await factory()
-            holder.capture = capture
-            warm = False
-            await client.query(user_prompt)
 
-        async for msg in client.receive_response():
-            if isinstance(msg, StreamEvent):
-                # real token streaming: forward text_delta events as they arrive
-                if stream_text:
-                    ev = msg.event or {}
-                    if ev.get("type") == "content_block_delta":
-                        delta = ev.get("delta") or {}
-                        if delta.get("type") == "text_delta" and delta.get("text"):
-                            emitted_text = True
-                            text_chars += len(delta["text"])
-                            yield ("text", delta["text"])
-            elif isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        if stream_text:
-                            buf.append(block.text)   # fallback only; deltas already sent
-                        elif buffering:
-                            text_chars += len(block.text)
-                            buf.append(block.text)
-                    elif isinstance(block, ThinkingBlock):
-                        logger.debug("thinking: %d chars", len(getattr(block, "thinking", "") or ""))
-                    elif isinstance(block, ToolUseBlock):
-                        logger.debug("assistant tool_use block: name=%s input=%s",
-                                     getattr(block, "name", "?"),
-                                     json.dumps(getattr(block, "input", {}))[:300])
-            elif isinstance(msg, SystemMessage):
-                logger.debug("system message: %s", getattr(msg, "subtype", ""))
-            elif isinstance(msg, ResultMessage):
-                capture["usage"] = _extract_usage(getattr(msg, "usage", None))
-                capture["stop_reason"] = getattr(msg, "stop_reason", None)
-                capture["structured_output"] = getattr(msg, "structured_output", None)
-                denials = getattr(msg, "permission_denials", None) or []
-                result_text = getattr(msg, "result", None)
-                logger.info(
-                    "result: turns=%s stop=%s error=%s denials=%d cost=$%s tokens=%s",
-                    getattr(msg, "num_turns", "?"), capture["stop_reason"],
-                    getattr(msg, "is_error", "?"), len(denials),
-                    getattr(msg, "total_cost_usd", "?"), capture.get("usage"),
-                )
-                if capture["structured_output"] is not None:
-                    logger.debug("native structured_output: %s",
-                                 json.dumps(capture["structured_output"])[:300])
-                if result_text:
-                    logger.debug("result text: %r", str(result_text)[:400])
-                break
-    finally:
-        # single-use: every served client is retired (success, error, timeout, cancel)
-        pool.schedule_retire(client)
+    async def drain(cli, hld, wrm):
+        """Query + consume one full response. Yields text events; fills `capture`.
+        Handles a stale-warm client by reconnecting cold once. Retires its client."""
+        nonlocal text_chars, emitted_text
+        hld.capture = capture
+        try:
+            try:
+                await cli.query(user_prompt)
+            except Exception as e:
+                if not wrm:
+                    raise
+                logger.warning("warm client stale (%s); retrying cold", e)
+                pool.schedule_retire(cli)
+                cli, hld = await factory()
+                hld.capture = capture
+                await cli.query(user_prompt)
+
+            async for msg in cli.receive_response():
+                if isinstance(msg, StreamEvent):
+                    if stream_text:
+                        ev = msg.event or {}
+                        if ev.get("type") == "content_block_delta":
+                            delta = ev.get("delta") or {}
+                            if delta.get("type") == "text_delta" and delta.get("text"):
+                                emitted_text = True
+                                text_chars += len(delta["text"])
+                                yield ("text", delta["text"])
+                elif isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            if stream_text:
+                                buf.append(block.text)   # fallback only; deltas already sent
+                            elif buffering:
+                                text_chars += len(block.text)
+                                buf.append(block.text)
+                        elif isinstance(block, ThinkingBlock):
+                            logger.debug("thinking: %d chars", len(getattr(block, "thinking", "") or ""))
+                        elif isinstance(block, ToolUseBlock):
+                            logger.debug("assistant tool_use block: name=%s input=%s",
+                                         getattr(block, "name", "?"),
+                                         json.dumps(getattr(block, "input", {}))[:300])
+                elif isinstance(msg, SystemMessage):
+                    logger.debug("system message: %s", getattr(msg, "subtype", ""))
+                elif isinstance(msg, ResultMessage):
+                    capture["usage"] = _extract_usage(getattr(msg, "usage", None))
+                    capture["stop_reason"] = getattr(msg, "stop_reason", None)
+                    capture["structured_output"] = getattr(msg, "structured_output", None)
+                    denials = getattr(msg, "permission_denials", None) or []
+                    result_text = getattr(msg, "result", None)
+                    logger.info(
+                        "result: turns=%s stop=%s error=%s denials=%d cost=$%s tokens=%s",
+                        getattr(msg, "num_turns", "?"), capture["stop_reason"],
+                        getattr(msg, "is_error", "?"), len(denials),
+                        getattr(msg, "total_cost_usd", "?"), capture.get("usage"),
+                    )
+                    if capture["structured_output"] is not None:
+                        logger.debug("native structured_output: %s",
+                                     json.dumps(capture["structured_output"])[:300])
+                    if result_text:
+                        logger.debug("result text: %r", str(result_text)[:400])
+                    break
+        finally:
+            pool.schedule_retire(cli)
+
+    # Structured output may need whole-request retries: if the model's StructuredOutput
+    # call fails schema validation and it runs out of turns, structured_output is empty.
+    # Chat/tools stream during drain, so they run exactly once.
+    attempts = config.STRUCTURED_RETRIES if mode == "structured" else 1
+    for attempt in range(max(1, attempts)):
+        if attempt == 0:
+            cli, hld, wrm = client, holder, warm
+        else:
+            logger.warning("structured retry %d/%d (prev stop=%s, empty output)",
+                           attempt, attempts - 1, capture.get("stop_reason"))
+            capture.clear()
+            buf.clear()
+            cli, hld = await factory()
+            wrm = False
+        async for ev in drain(cli, hld, wrm):
+            yield ev
+        if mode != "structured" or capture.get("structured_output") is not None:
+            break
 
     calls = capture.get("calls") or []
     blocked = capture.get("blocked") or []
@@ -364,9 +390,12 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         if structured is not None:
             yield ("text", json.dumps(structured))
         else:
-            logger.warning("structured request produced no structured_output (stop=%s); "
-                           "falling back to buffered text", capture.get("stop_reason"))
-            yield ("text", "".join(buf))
+            # never return the model's preamble as if it were JSON — surface a clean error
+            logger.warning("structured output empty after %d attempt(s) (stop=%s); returning error",
+                           max(1, attempts), capture.get("stop_reason"))
+            yield ("error", {
+                "message": "Model did not produce output matching the requested schema.",
+                "type": "api_error", "code": "structured_output_failed"})
         yield ("done", None)
         return
 
