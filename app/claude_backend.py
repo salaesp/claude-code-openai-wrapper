@@ -176,8 +176,11 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
         directive = (
             "\n\nReturn your answer by producing a single JSON object that strictly "
             "matches the required schema — correct field names, types, enums, and all "
-            "required fields. Do not write any explanation, preamble, or commentary; "
-            "emit only the structured result."
+            "required fields. The object's top-level keys MUST be the schema's own "
+            "properties. Do NOT wrap the result in any envelope key such as "
+            "\"parameter\", \"input\", \"arguments\", \"value\", or \"result\" — emit "
+            "the schema object directly. Do not write any explanation, preamble, or "
+            "commentary; emit only the structured result on your first attempt."
         )
         return build(dict(
             output_format={"type": "json_schema", "schema": schema},
@@ -250,8 +253,11 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
            ("tools" if n_tools else "chat")
     forced = req.tool_choice in ("required", "any") or isinstance(req.tool_choice, dict) \
         or mode == "structured"
-    # tools/structured use TOOL_MAX_TURNS; single-turn applies to plain chat only
-    eff_turns = config.TOOL_MAX_TURNS if mode != "chat" else (1 if config.SINGLE_TURN else config.MAX_TURNS)
+    # Report the turn budget each mode actually runs with (see _make_options):
+    # structured -> STRUCTURED_MAX_TURNS, tools -> TOOL_MAX_TURNS, chat -> single/MAX.
+    eff_turns = config.STRUCTURED_MAX_TURNS if mode == "structured" else \
+        config.TOOL_MAX_TURNS if mode == "tools" else \
+        (1 if config.SINGLE_TURN else config.MAX_TURNS)
 
     key = _request_key(req, mode)
 
