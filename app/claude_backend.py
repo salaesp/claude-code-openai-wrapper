@@ -62,6 +62,10 @@ def _extract_usage(usage) -> dict:
         "prompt_tokens": prompt,
         "completion_tokens": out,
         "total_tokens": prompt + out,
+        # breakdown (underscored: dropped before returning OpenAI usage to client)
+        "_input": inp,
+        "_cache_read": cache_read,
+        "_cache_create": cache_create,
     }
 
 
@@ -345,11 +349,15 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
                     capture["structured_output"] = getattr(msg, "structured_output", None)
                     denials = getattr(msg, "permission_denials", None) or []
                     result_text = getattr(msg, "result", None)
+                    u = capture["usage"]
                     logger.info(
-                        "result: turns=%s stop=%s error=%s denials=%d cost=$%s tokens=%s",
+                        "result: turns=%s stop=%s error=%s denials=%d cost=$%s "
+                        "tokens=out:%s in:%s cache_read:%s cache_create:%s",
                         getattr(msg, "num_turns", "?"), capture["stop_reason"],
                         getattr(msg, "is_error", "?"), len(denials),
-                        getattr(msg, "total_cost_usd", "?"), capture.get("usage"),
+                        getattr(msg, "total_cost_usd", "?"),
+                        u.get("completion_tokens"), u.get("_input"),
+                        u.get("_cache_read"), u.get("_cache_create"),
                     )
                     if capture["structured_output"] is not None:
                         logger.debug("native structured_output: %s",
@@ -389,7 +397,8 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
 
     usage = capture.get("usage")
     if usage:
-        yield ("usage", usage)
+        # drop internal breakdown keys; client gets clean OpenAI usage
+        yield ("usage", {k: v for k, v in usage.items() if not k.startswith("_")})
 
     # structured output -> native JSON from the CLI, returned as message content
     if mode == "structured":
