@@ -177,20 +177,11 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
         if req.response_format.type == "json_schema" and req.response_format.json_schema:
             schema = req.response_format.json_schema.get("schema", schema)
         logger.debug("structured native output_format schema=%s", json.dumps(schema)[:300])
-        directive = (
-            "\n\nReturn your answer by producing a single JSON object that strictly "
-            "matches the required schema — correct field names, types, enums, and all "
-            "required fields. The object's top-level keys MUST be the schema's own "
-            "properties. Do NOT wrap the result in any envelope key such as "
-            "\"parameter\", \"input\", \"arguments\", \"value\", or \"result\" — emit "
-            "the schema object directly. Do not write any explanation, preamble, or "
-            "commentary; emit only the structured result on your first attempt."
-        )
         return build(dict(
             output_format={"type": "json_schema", "schema": schema},
             allowed_tools=[],   # no tools -> model answers directly from the prompt
-            max_turns=config.STRUCTURED_MAX_TURNS,   # room to self-correct on schema misses
-            system_prompt=_with_guardrail(system_prompt) + directive,
+            max_turns=config.STRUCTURED_MAX_TURNS,
+            system_prompt=_with_guardrail(system_prompt),
         ))
 
     # === passthrough function tools ===

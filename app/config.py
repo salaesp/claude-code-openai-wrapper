@@ -31,11 +31,10 @@ def _apply() -> None:
     # Ceiling for tool/structured requests: enough for the ToolSearch round-trip
     # (~4 turns) plus a little slack. Lower = less room for agentic wandering.
     TOOL_MAX_TURNS = int(os.environ.get("TOOL_MAX_TURNS", "5"))
-    # Structured output turn budget. Kept low on purpose: when native --json-schema
-    # fails to converge the failure is systematic (bad envelope), not transient, so
-    # extra turns only burn tokens + wall-clock without ever validating. Each haiku
-    # turn on a big schema is ~40-50s; the budget MUST fit inside REQUEST_TIMEOUT.
-    STRUCTURED_MAX_TURNS = int(os.environ.get("STRUCTURED_MAX_TURNS", "3"))
+    # Structured output turn budget. Native --json-schema (CLI >= 2.1.x with API-side
+    # schema enforcement) converges in exactly 2 turns; extra turns only burn
+    # wall-clock on genuine failures. The budget MUST fit inside REQUEST_TIMEOUT.
+    STRUCTURED_MAX_TURNS = int(os.environ.get("STRUCTURED_MAX_TURNS", "2"))
     # Whole-request retries when structured output comes back empty. Default 1 (no
     # retry): the outer REQUEST_TIMEOUT wraps ALL attempts, so a slow first attempt
     # leaves no budget for a second — retries just double cost and still 504.
