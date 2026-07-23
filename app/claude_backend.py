@@ -42,7 +42,7 @@ from claude_agent_sdk import (
 
 from . import config
 from .models import ChatCompletionRequest
-from .translate import build_prompt
+from .translate import build_prompt, build_tail_prompt
 
 MCP_SERVER = "openai"
 TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
@@ -103,6 +103,7 @@ def _request_key(req: ChatCompletionRequest, mode: str) -> str:
         "tools": [t.model_dump() for t in req.tools] if req.tools else None,
         "tool_choice": req.tool_choice if isinstance(req.tool_choice, str) else
                        (json.dumps(req.tool_choice, sort_keys=True) if req.tool_choice else None),
+        "effort": req.reasoning_effort,
         # config knobs that alter options at build time
         "single_turn": config.SINGLE_TURN,
         "concise": config.CONCISE,
@@ -135,6 +136,24 @@ CONCISE_DIRECTIVE = (
 )
 
 
+def _sanitize_schema(schema: dict) -> dict:
+    """Make a client-supplied JSON Schema safe for the CLI's draft-07 validator.
+
+    OpenAI clients often emit `$schema: .../2020-12`, which the SDK rejects
+    outright (it validates as draft-07 and refuses newer declarations). The
+    keyword is only a version annotation — dropping it keeps semantics.
+    """
+    if "$schema" in schema:
+        schema = {k: v for k, v in schema.items() if k != "$schema"}
+    return schema
+
+
+# OpenAI reasoning_effort -> CLI --effort. "minimal" has no CLI equivalent; low
+# is the floor. Unknown values are ignored (OpenAI-style: tolerate, don't reject).
+_EFFORT_MAP = {"minimal": "low", "low": "low", "medium": "medium",
+               "high": "high", "xhigh": "xhigh"}
+
+
 def _with_guardrail(system_prompt: str) -> str:
     parts = [system_prompt.strip()] if system_prompt else []
     parts.append(LLM_GUARDRAIL)
@@ -143,7 +162,8 @@ def _with_guardrail(system_prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAgentOptions:
+def _make_options(req: ChatCompletionRequest, holder: CaptureHolder,
+                  resume: str | None = None) -> ClaudeAgentOptions:
     """Build SDK options. Three modes:
 
     - structured: native --json-schema output (no MCP, no ToolSearch, single exchange)
@@ -166,6 +186,17 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
         base["thinking"] = {"type": "disabled"}
     if req.model:
         base["model"] = req.model
+    if req.reasoning_effort:
+        effort = _EFFORT_MAP.get(req.reasoning_effort)
+        if effort:
+            base["effort"] = effort
+        else:
+            logger.debug("ignoring unknown reasoning_effort=%r", req.reasoning_effort)
+    if resume:
+        # Fork on resume: each request gets its own copy of the warmed session,
+        # so a client branching from the same prefix never contaminates siblings.
+        base["resume"] = resume
+        base["fork_session"] = True
 
     def build(opts: dict) -> ClaudeAgentOptions:
         merged = {**base, **opts}
@@ -176,6 +207,7 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
         schema = {"type": "object"}
         if req.response_format.type == "json_schema" and req.response_format.json_schema:
             schema = req.response_format.json_schema.get("schema", schema)
+        schema = _sanitize_schema(schema)
         logger.debug("structured native output_format schema=%s", json.dumps(schema)[:300])
         return build(dict(
             output_format={"type": "json_schema", "schema": schema},
@@ -239,9 +271,9 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder) -> ClaudeAg
 async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     """Yield ("text", str) / ("tool_calls", list) / ("done", None)."""
     from .pool import pool
+    from .sessions import canon_message, sessions
 
     capture: dict = {}
-    _, user_prompt = build_prompt(req.messages)
 
     n_tools = len(req.tools or [])
     mode = "structured" if req.response_format and req.response_format.type != "text" else \
@@ -254,21 +286,40 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         config.TOOL_MAX_TURNS if mode == "tools" else \
         (1 if config.SINGLE_TURN else config.MAX_TURNS)
 
+    # Session resume: if the incoming history extends a conversation we've served,
+    # resume (a fork of) that Claude session and send only the new tail.
+    # Structured mode stays stateless — it's single-shot by construction.
+    resume_session: str | None = None
+    if mode in ("chat", "tools"):
+        hit = sessions.match(req.messages)
+        if hit:
+            resume_session, split = hit
+            user_prompt = build_tail_prompt(req.messages[split:])
+    if resume_session is None:
+        _, user_prompt = build_prompt(req.messages)
+
     key = _request_key(req, mode)
 
-    async def factory():
+    async def factory(resume: str | None = None):
         holder = CaptureHolder()
-        options = _make_options(req, holder)
+        options = _make_options(req, holder, resume=resume)
         client = ClaudeSDKClient(options=options)
         await client.connect()
         return client, holder
 
-    client, holder, warm = await pool.checkout(key, factory)
-    pool.schedule_refill(key, factory)   # replacement spawns while this request runs
+    if resume_session:
+        # Session-specific spawn: the warm pool can't pre-build these.
+        client, holder = await factory(resume_session)
+        warm = False
+    else:
+        client, holder, warm = await pool.checkout(key, factory)
+        pool.schedule_refill(key, factory)   # replacement spawns while this request runs
 
     logger.info(
-        "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d warm=%s prompt_chars=%d",
-        req.model, mode, len(req.messages), n_tools, forced, eff_turns, warm, len(user_prompt),
+        "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d warm=%s "
+        "resume=%s prompt_chars=%d",
+        req.model, mode, len(req.messages), n_tools, forced, eff_turns, warm,
+        resume_session or "-", len(user_prompt),
     )
     logger.debug("tool_choice=%s response_format=%s prompt=%r",
                  req.tool_choice,
@@ -337,6 +388,8 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
                 elif isinstance(msg, ResultMessage):
                     capture["usage"] = _extract_usage(getattr(msg, "usage", None))
                     capture["stop_reason"] = getattr(msg, "stop_reason", None)
+                    capture["subtype"] = getattr(msg, "subtype", None)
+                    capture["session_id"] = getattr(msg, "session_id", None)
                     capture["structured_output"] = getattr(msg, "structured_output", None)
                     denials = getattr(msg, "permission_denials", None) or []
                     result_text = getattr(msg, "result", None)
@@ -359,11 +412,31 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         finally:
             pool.schedule_retire(cli)
 
+    # Resume path runs once, with fallback to full replay if the session is gone
+    # (evicted JSONL, restarted container) — safe only before any text streamed.
+    resume_done = False
+    if resume_session:
+        try:
+            async for ev in drain(client, holder, False):
+                yield ev
+            resume_done = True
+        except Exception as e:
+            if emitted_text:
+                raise   # already streamed to the client; can't restart cleanly
+            logger.warning("session resume failed (%s: %s); falling back to full replay",
+                           type(e).__name__, e)
+            capture.clear()
+            buf.clear()
+            resume_session = None
+            _, user_prompt = build_prompt(req.messages)
+            client, holder, warm = await pool.checkout(key, factory)
+            pool.schedule_refill(key, factory)
+
     # Structured output may need whole-request retries: if the model's StructuredOutput
     # call fails schema validation and it runs out of turns, structured_output is empty.
     # Chat/tools stream during drain, so they run exactly once.
     attempts = config.STRUCTURED_RETRIES if mode == "structured" else 1
-    for attempt in range(max(1, attempts)):
+    for attempt in range(max(1, attempts)) if not resume_done else []:
         if attempt == 0:
             cli, hld, wrm = client, holder, warm
         else:
@@ -386,6 +459,17 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     logger.info("done: outcome=%s text_chars=%d captured=%d blocked=%d elapsed=%.0fms",
                 outcome, text_chars, len(calls), len(blocked), elapsed)
 
+    # Remember this conversation's session so the client's next request (history +
+    # our reply) resumes it instead of replaying everything.
+    if mode in ("chat", "tools") and capture.get("session_id"):
+        if calls:
+            reply = canon_message(
+                "assistant", "",
+                [(c["name"], json.dumps(c["args"])) for c in calls])
+        else:
+            reply = canon_message("assistant", "".join(buf))
+        sessions.store(req.messages, reply, capture["session_id"])
+
     usage = capture.get("usage")
     if usage:
         # drop internal breakdown keys; client gets clean OpenAI usage
@@ -397,11 +481,17 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
             yield ("text", json.dumps(structured))
         else:
             # never return the model's preamble as if it were JSON — surface a clean error
-            logger.warning("structured output empty after %d attempt(s) (stop=%s); returning error",
-                           max(1, attempts), capture.get("stop_reason"))
+            subtype = capture.get("subtype")
+            logger.warning("structured output empty after %d attempt(s) (stop=%s subtype=%s); returning error",
+                           max(1, attempts), capture.get("stop_reason"), subtype)
+            if subtype == "error_max_structured_output_retries":
+                message = ("Model output failed schema validation after the SDK's "
+                           "retry limit. Simplify the schema or retry.")
+            else:
+                message = "Model did not produce output matching the requested schema."
             yield ("error", {
-                "message": "Model did not produce output matching the requested schema.",
-                "type": "api_error", "code": "structured_output_failed"})
+                "message": message, "type": "api_error",
+                "code": subtype or "structured_output_failed"})
         yield ("done", None)
         return
 

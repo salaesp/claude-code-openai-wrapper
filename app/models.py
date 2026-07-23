@@ -51,6 +51,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None                  # accepted, forwarded where possible
     max_tokens: int | None = None
+    reasoning_effort: str | None = None               # minimal|low|medium|high (+xhigh) -> CLI --effort
     # unsupported OpenAI fields are ignored, not rejected
 
 

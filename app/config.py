@@ -22,6 +22,7 @@ def _apply() -> None:
     global SINGLE_TURN, DISABLE_THINKING, TOOL_MAX_TURNS, CONCISE
     global WARM_POOL, POOL_MAX_KEYS, POOL_TTL_S
     global STRUCTURED_MAX_TURNS, STRUCTURED_RETRIES
+    global SESSION_RESUME, SESSION_TTL_S, SESSION_MAX
     API_KEY = os.environ.get("WRAPPER_API_KEY", "changeme")
     DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
     EXPOSED_MODELS = os.environ.get(
@@ -49,6 +50,11 @@ def _apply() -> None:
     WARM_POOL = os.environ.get("WARM_POOL", "1") not in ("0", "false", "False")
     POOL_MAX_KEYS = int(os.environ.get("POOL_MAX_KEYS", "3"))
     POOL_TTL_S = int(os.environ.get("POOL_TTL_S", "300"))
+    # Session resume: map conversation-prefix hashes to Claude session IDs so
+    # follow-up requests resume (forked) instead of replaying full history.
+    SESSION_RESUME = os.environ.get("SESSION_RESUME", "1") not in ("0", "false", "False")
+    SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", "3600"))
+    SESSION_MAX = int(os.environ.get("SESSION_MAX", "500"))
 
 
 def reload() -> None:
