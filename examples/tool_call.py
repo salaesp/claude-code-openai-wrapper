@@ -21,7 +21,7 @@ messages = [{"role": "user", "content": "What's the weather in Paris?"}]
 
 # 1) model asks for a tool call
 r = client.chat.completions.create(
-    model="claude-haiku-4-5", messages=messages, tools=tools, tool_choice="required"
+    model="claude-sonnet-5", messages=messages, tools=tools, tool_choice="required"
 )
 call = r.choices[0].message.tool_calls[0]
 print("model wants:", call.function.name, call.function.arguments)
@@ -36,6 +36,6 @@ messages.append({"role": "tool", "tool_call_id": call.id,
                  "name": call.function.name, "content": result})
 
 final = client.chat.completions.create(
-    model="claude-haiku-4-5", messages=messages, tools=tools
+    model="claude-sonnet-5", messages=messages, tools=tools
 )
 print("final:", final.choices[0].message.content)

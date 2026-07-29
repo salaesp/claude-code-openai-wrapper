@@ -50,8 +50,8 @@ uvicorn app.server:app --host 0.0.0.0 --port 8000
 | var | default | meaning |
 |-----|---------|---------|
 | `WRAPPER_API_KEY` | `changeme` | key clients send as `Authorization: Bearer …` |
-| `CLAUDE_MODEL` | `claude-opus-4-8` | default model id |
-| `EXPOSED_MODELS` | opus/sonnet/haiku | ids listed at `GET /v1/models` |
+| `CLAUDE_MODEL` | `claude-opus-5` | default model id |
+| `EXPOSED_MODELS` | `claude-fable-5,claude-opus-5,claude-sonnet-5` | ids listed at `GET /v1/models` |
 | `CLAUDE_MAX_TURNS` | `8` | agent turn ceiling per request |
 | `REQUEST_TIMEOUT` | `180` | seconds per request |
 
@@ -61,14 +61,14 @@ Plain chat:
 ```bash
 curl localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $WRAPPER_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 OpenAI Python SDK:
 ```python
 from openai import OpenAI
 c = OpenAI(base_url="http://localhost:8000/v1", api_key="YOUR_WRAPPER_API_KEY")
-c.chat.completions.create(model="claude-opus-4-8",
+c.chat.completions.create(model="claude-opus-5",
     messages=[{"role":"user","content":"2+2?"}])
 ```
 

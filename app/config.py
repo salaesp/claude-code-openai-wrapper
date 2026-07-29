@@ -24,9 +24,9 @@ def _apply() -> None:
     global STRUCTURED_MAX_TURNS, STRUCTURED_RETRIES
     global SESSION_RESUME, SESSION_TTL_S, SESSION_MAX
     API_KEY = os.environ.get("WRAPPER_API_KEY", "changeme")
-    DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
+    DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
     EXPOSED_MODELS = os.environ.get(
-        "EXPOSED_MODELS", "claude-opus-4-8,claude-sonnet-5,claude-haiku-4-5"
+        "EXPOSED_MODELS", "claude-fable-5,claude-opus-5,claude-sonnet-5"
     ).split(",")
     MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "8"))
     # Ceiling for tool/structured requests: enough for the ToolSearch round-trip

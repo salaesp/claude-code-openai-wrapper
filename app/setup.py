@@ -179,7 +179,7 @@ async def setup_save(
     request: Request,
     wrapper_key: str = Form(...),
     oauth_token: str = Form(""),
-    model: str = Form("claude-opus-4-8"),
+    model: str = Form("claude-opus-5"),
     single_turn: str = Form("0"),      # checkbox: present ("1") only when checked
     disable_thinking: str = Form("0"),
     concise: str = Form("0"),

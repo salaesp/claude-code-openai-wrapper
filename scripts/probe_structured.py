@@ -21,7 +21,7 @@ Read the verdict at the end:
 
 Usage:
   export CLAUDE_CODE_OAUTH_TOKEN=...        # your subscription token
-  python scripts/probe_structured.py [--model claude-haiku-4-5] [--turns 3]
+  python scripts/probe_structured.py [--model claude-sonnet-5] [--turns 3]
 """
 from __future__ import annotations
 
@@ -169,7 +169,7 @@ async def run_case(name: str, schema: dict, prompt: str, model: str, turns: int)
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="claude-haiku-4-5")
+    ap.add_argument("--model", default="claude-sonnet-5")
     ap.add_argument("--turns", type=int, default=3)
     args = ap.parse_args()
 

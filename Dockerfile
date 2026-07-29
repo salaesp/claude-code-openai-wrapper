@@ -25,7 +25,7 @@ ENV HOME=/home/app
 
 # WRAPPER_API_KEY and CLAUDE_CODE_OAUTH_TOKEN must be supplied at runtime (-e / compose).
 # Nothing sensitive is baked into the image.
-ENV CLAUDE_MODEL=claude-opus-4-8
+ENV CLAUDE_MODEL=claude-opus-5
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
