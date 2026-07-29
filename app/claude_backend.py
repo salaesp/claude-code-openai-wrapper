@@ -94,15 +94,16 @@ def _request_key(req: ChatCompletionRequest, mode: str) -> str:
     client pre-spawned for one can safely serve the other.
     """
     system_prompt, _ = build_prompt(req.messages)
+    uses_tools = bool(req.tools) and req.tool_choice != "none"
     sig = {
         "mode": mode,
         "model": req.model,
         "system": system_prompt,
         "schema": (req.response_format.json_schema or {}) if req.response_format else None,
         "rf_type": req.response_format.type if req.response_format else None,
-        "tools": [t.model_dump() for t in req.tools] if req.tools else None,
-        "tool_choice": req.tool_choice if isinstance(req.tool_choice, str) else
-                       (json.dumps(req.tool_choice, sort_keys=True) if req.tool_choice else None),
+        "tools": [t.model_dump() for t in req.tools] if uses_tools else None,
+        "tool_choice": req.tool_choice if uses_tools and isinstance(req.tool_choice, str) else
+                       (json.dumps(req.tool_choice, sort_keys=True) if uses_tools and req.tool_choice else None),
         "effort": req.reasoning_effort,
         # config knobs that alter options at build time
         "single_turn": config.SINGLE_TURN,
@@ -217,7 +218,7 @@ def _make_options(req: ChatCompletionRequest, holder: CaptureHolder,
         ))
 
     # === passthrough function tools ===
-    if req.tools:
+    if req.tools and req.tool_choice != "none":
         sdk_tools, tool_names = [], []
         for t in req.tools:
             name = t.function.name
@@ -273,9 +274,10 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     from .pool import pool
     from .sessions import canon_message, sessions
 
+    run_started = time.perf_counter()
     capture: dict = {}
 
-    n_tools = len(req.tools or [])
+    n_tools = len(req.tools or []) if req.tool_choice != "none" else 0
     mode = "structured" if req.response_format and req.response_format.type != "text" else \
            ("tools" if n_tools else "chat")
     forced = req.tool_choice in ("required", "any") or isinstance(req.tool_choice, dict) \
@@ -287,16 +289,18 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         (1 if config.SINGLE_TURN else config.MAX_TURNS)
 
     # Session resume: if the incoming history extends a conversation we've served,
-    # resume (a fork of) that Claude session and send only the new tail.
-    # Structured mode stays stateless — it's single-shot by construction.
+    # resume (a fork of) that Claude session and send only the new tail. Native
+    # structured output can safely fall back to a full replay if resume fails.
     resume_session: str | None = None
-    if mode in ("chat", "tools"):
+    if mode in ("chat", "tools", "structured"):
         hit = sessions.match(req.messages)
         if hit:
             resume_session, split = hit
-            user_prompt = build_tail_prompt(req.messages[split:])
+            user_prompt = build_tail_prompt(
+                req.messages[split:], tools_available=mode == "tools"
+            )
     if resume_session is None:
-        _, user_prompt = build_prompt(req.messages)
+        _, user_prompt = build_prompt(req.messages, tools_available=mode == "tools")
 
     key = _request_key(req, mode)
 
@@ -307,19 +311,27 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
         await client.connect()
         return client, holder
 
+    client_setup_started = time.perf_counter()
     if resume_session:
         # Session-specific spawn: the warm pool can't pre-build these.
-        client, holder = await factory(resume_session)
-        warm = False
-    else:
+        try:
+            client, holder = await factory(resume_session)
+            warm = False
+        except Exception as e:
+            logger.warning("session resume connect failed (%s: %s); falling back to full replay",
+                           type(e).__name__, e)
+            resume_session = None
+            _, user_prompt = build_prompt(req.messages, tools_available=mode == "tools")
+    if resume_session is None:
         client, holder, warm = await pool.checkout(key, factory)
         pool.schedule_refill(key, factory)   # replacement spawns while this request runs
+    client_setup_ms = (time.perf_counter() - client_setup_started) * 1000
 
     logger.info(
         "request: model=%s mode=%s messages=%d tools=%d forced=%s max_turns=%d warm=%s "
-        "resume=%s prompt_chars=%d",
+        "resume=%s prompt_chars=%d client_setup=%.0fms",
         req.model, mode, len(req.messages), n_tools, forced, eff_turns, warm,
-        resume_session or "-", len(user_prompt),
+        resume_session or "-", len(user_prompt), client_setup_ms,
     )
     logger.debug("tool_choice=%s response_format=%s prompt=%r",
                  req.tool_choice,
@@ -341,11 +353,12 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     t0 = time.perf_counter()
     text_chars = 0
     emitted_text = False
+    first_assistant_ms: float | None = None
 
     async def drain(cli, hld, wrm):
         """Query + consume one full response. Yields text events; fills `capture`.
         Handles a stale-warm client by reconnecting cold once. Retires its client."""
-        nonlocal text_chars, emitted_text
+        nonlocal text_chars, emitted_text, first_assistant_ms
         hld.capture = capture
         try:
             try:
@@ -366,10 +379,14 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
                         if ev.get("type") == "content_block_delta":
                             delta = ev.get("delta") or {}
                             if delta.get("type") == "text_delta" and delta.get("text"):
+                                if first_assistant_ms is None:
+                                    first_assistant_ms = (time.perf_counter() - run_started) * 1000
                                 emitted_text = True
                                 text_chars += len(delta["text"])
                                 yield ("text", delta["text"])
                 elif isinstance(msg, AssistantMessage):
+                    if first_assistant_ms is None:
+                        first_assistant_ms = (time.perf_counter() - run_started) * 1000
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text:
                             if stream_text:
@@ -428,7 +445,7 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
             capture.clear()
             buf.clear()
             resume_session = None
-            _, user_prompt = build_prompt(req.messages)
+            _, user_prompt = build_prompt(req.messages, tools_available=mode == "tools")
             client, holder, warm = await pool.checkout(key, factory)
             pool.schedule_refill(key, factory)
 
@@ -455,20 +472,29 @@ async def run(req: ChatCompletionRequest) -> AsyncIterator[tuple[str, Any]]:
     blocked = capture.get("blocked") or []
     structured = capture.get("structured_output")
     elapsed = (time.perf_counter() - t0) * 1000
+    total_elapsed = (time.perf_counter() - run_started) * 1000
+    first_assistant = f"{first_assistant_ms:.0f}ms" if first_assistant_ms is not None else "-"
     outcome = "structured" if mode == "structured" else ("tool_calls" if calls else "text")
-    logger.info("done: outcome=%s text_chars=%d captured=%d blocked=%d elapsed=%.0fms",
-                outcome, text_chars, len(calls), len(blocked), elapsed)
+    logger.info(
+        "done: outcome=%s text_chars=%d captured=%d blocked=%d first_assistant=%s "
+        "elapsed=%.0fms total=%.0fms",
+        outcome, text_chars, len(calls), len(blocked), first_assistant, elapsed, total_elapsed,
+    )
 
     # Remember this conversation's session so the client's next request (history +
     # our reply) resumes it instead of replaying everything.
-    if mode in ("chat", "tools") and capture.get("session_id"):
+    if mode in ("chat", "tools", "structured") and capture.get("session_id"):
+        reply = None
         if calls:
             reply = canon_message(
                 "assistant", "",
                 [(c["name"], json.dumps(c["args"])) for c in calls])
-        else:
+        elif mode == "structured" and structured is not None:
+            reply = canon_message("assistant", json.dumps(structured))
+        elif mode != "structured":
             reply = canon_message("assistant", "".join(buf))
-        sessions.store(req.messages, reply, capture["session_id"])
+        if reply is not None:
+            sessions.store(req.messages, reply, capture["session_id"])
 
     usage = capture.get("usage")
     if usage:

@@ -55,34 +55,38 @@ def _render(messages: list[Message]) -> tuple[list[str], list[str]]:
     return system_chunks, convo
 
 
-def _finish(convo: list[str], continuation: bool = False) -> str:
+def _finish(convo: list[str], continuation: bool = False,
+            tools_available: bool = True) -> str:
     if convo and convo[-1].startswith("User:"):
         # normal case: last turn is the user asking
         return "\n".join(convo).strip()
     # last turn was a tool result -> instruct Claude to continue
     convo = convo + ["Assistant:"]
-    lead = ("Continue the conversation. Use the tool results below; call another "
-            "tool only if you still need one.\n\n") if continuation else \
-           ("Continue the conversation below. Use the tool results already "
-            "provided; call another tool only if you still need one.\n\n")
+    if tools_available:
+        lead = ("Continue the conversation. Use the tool results below; call another "
+                "tool only if you still need one.\n\n") if continuation else \
+               ("Continue the conversation below. Use the tool results already "
+                "provided; call another tool only if you still need one.\n\n")
+    else:
+        lead = "Continue the conversation using the tool results already provided.\n\n"
     return (lead + "\n".join(convo)).strip()
 
 
-def build_prompt(messages: list[Message]) -> tuple[str, str]:
+def build_prompt(messages: list[Message], tools_available: bool = True) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) for the full stateless history."""
     system_chunks, convo = _render(messages)
     system_prompt = "\n\n".join(c for c in system_chunks if c).strip()
-    return system_prompt, _finish(convo)
+    return system_prompt, _finish(convo, tools_available=tools_available)
 
 
-def build_tail_prompt(tail: list[Message]) -> str:
+def build_tail_prompt(tail: list[Message], tools_available: bool = True) -> str:
     """Render only the delta messages for a resumed session.
 
     The session already holds everything before `tail`; system messages in the
     tail are ignored (the system prompt travels via options on every spawn).
     """
     _, convo = _render([m for m in tail if m.role != "system"])
-    return _finish(convo, continuation=True)
+    return _finish(convo, continuation=True, tools_available=tools_available)
 
 
 def openai_tool_to_sdk(tool) -> tuple[str, str, dict]:

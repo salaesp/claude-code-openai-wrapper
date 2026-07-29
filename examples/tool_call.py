@@ -35,7 +35,14 @@ messages.append(r.choices[0].message.model_dump())
 messages.append({"role": "tool", "tool_call_id": call.id,
                  "name": call.function.name, "content": result})
 
-final = client.chat.completions.create(
-    model="claude-sonnet-5", messages=messages, tools=tools
+# Tools are no longer needed. Omitting them selects the single-turn chat path
+# and streams the final answer instead of buffering it behind the tool path.
+stream = client.chat.completions.create(
+    model="claude-sonnet-5", messages=messages, stream=True
 )
-print("final:", final.choices[0].message.content)
+print("final:", end=" ")
+for chunk in stream:
+    text = chunk.choices[0].delta.content
+    if text:
+        print(text, end="", flush=True)
+print()

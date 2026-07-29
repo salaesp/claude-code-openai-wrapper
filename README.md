@@ -136,6 +136,8 @@ Three request modes, each tuned differently (all configurable in `/setup`):
 
 Other notes:
 
+- Set `tool_choice: "none"` (or omit `tools`) once a client has all tool results it needs. The wrapper then uses the plain-chat path, avoiding MCP `ToolSearch` and enabling token streaming for the final response.
+- Structured requests also resume a matching in-memory session and send only the new tail. If the CLI cannot resume it, the wrapper safely retries with the complete history.
 - **`SINGLE_TURN` is chat-only.** Tool/structured requests use `TOOL_MAX_TURNS` so their
   internal steps can complete; forcing 1 turn there returns empty responses.
 - **`error=True` in `result:` logs is expected for passthrough tool calls** — we capture
@@ -143,6 +145,14 @@ Other notes:
   response is still correct. (Structured mode logs `error=False`.)
 - **Set log level to `DEBUG`** (in `/setup` or `LOG_LEVEL`) to see the prompt, per-block
   tool_use, and the SDK result text.
+
+### Lower-latency workflows
+
+Keep tool selection and final generation as separate stages. Once the client has the tool
+results it needs, omit `tools` and set `stream: true` for the final natural-language answer.
+For structured follow-up work, send a compact handoff of the collected facts rather than a
+verbose intermediate report plus the entire source snapshot. Run independent structured
+requests concurrently when subscription limits allow it.
 
 ## Performance
 
